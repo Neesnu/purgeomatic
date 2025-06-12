@@ -1,10 +1,9 @@
 import os
-import config
+import sys
 import json
 import requests
 from datetime import datetime
-import jq
-import sys
+import config
 
 c = config.Config()
 if not c.check("tautulliAPIkey", "radarrAPIkey"):
@@ -14,7 +13,6 @@ if not c.check("tautulliAPIkey", "radarrAPIkey"):
 c.apicheck(c.radarrHost, c.radarrAPIkey)
 
 protected = []
-
 if os.path.exists("./protected"):
     with open("./protected", "r") as file:
         for line in file:
@@ -24,130 +22,113 @@ if os.path.exists("./protected"):
 
 try:
     protected_tags = [int(i) for i in c.radarrProtectedTags.split(",")]
-except Exception as e:
+except Exception:
     protected_tags = []
-
 
 print("--------------------------------------")
 print(datetime.now().isoformat())
+
+def extract_guids(resp_json):
+    guids = []
+    if isinstance(resp_json, dict) and 'response' in resp_json:
+        data_section = resp_json['response'].get('data', {})
+        if isinstance(data_section, dict) and 'metadata' in data_section and 'guids' in data_section['metadata']:
+            guids = data_section['metadata']['guids']
+        else:
+            for entry in data_section.get('data', []):
+                data_field = entry.get('data', {})
+                if 'guids' in data_field:
+                    guids.extend(data_field['guids'])
+    elif isinstance(resp_json, list):
+        for entry in resp_json:
+            data_field = entry.get('data', {})
+            if 'guids' in data_field:
+                guids.extend(data_field['guids'])
+    return guids
 
 
 def purge(movie):
     deletesize = 0
     tmdbid = None
 
+    # get metadata
     r = requests.get(
         f"{c.tautulliHost}/api/v2/?apikey={c.tautulliAPIkey}&cmd=get_metadata&rating_key={movie['rating_key']}"
     )
+    guids = extract_guids(r.json())
+    for guid in guids:
+        if isinstance(guid, str) and guid.startswith("tmdb://"):
+            tmdbid = guid.split("tmdb://", 1)[1]
+            break
 
-    guids = jq.compile(".[].data.guids").input(r.json()).first()
-    try:
-        if guids:
-            tmdbid = [i for i in guids if i.startswith("tmdb://")][0].split(
-                "tmdb://", 1
-            )[1]
-    except Exception as e:
-        print(
-            f"WARNING: {movie['title']}: Unexpected GUID metadata from Tautulli. Please refresh your library's metadata in Plex. Using less-accurate 'search mode' for this title. Error message: "
-            + str(e)
-        )
-        guids = []
-
-    f = requests.get(f"{c.radarrHost}/api/v3/movie?apiKey={c.radarrAPIkey}")
-    try:
-        if guids:
-            radarr = (
-                jq.compile(f".[] | select(.tmdbId == {tmdbid})").input(f.json()).first()
-            )
-        else:
-            radarr = (
-                jq.compile(f".[] | select(.title == \"{movie['title']}\")")
-                .input(f.json())
-                .first()
-            )
-
-        if radarr["tmdbId"] in protected:
-            return deletesize
-
-        if any(e in protected_tags for e in radarr["tags"]):
-            return deletesize
-
-        if not c.dryrun:
-            response = requests.delete(
-                f"{c.radarrHost}/api/v3/movie/"
-                + str(radarr["id"])
-                + f"?apiKey={c.radarrAPIkey}&deleteFiles=true"
-            )
-
+    # find in Radarr
+    radarr_resp = requests.get(f"{c.radarrHost}/api/v3/movie?apiKey={c.radarrAPIkey}")
+    radarr_list = radarr_resp.json()
+    if tmdbid:
         try:
-            if not c.dryrun and c.overseerrAPIkey is not None:
-                headers = {"X-Api-Key": f"{c.overseerrAPIkey}"}
-                o = requests.get(
-                    f"{c.overseerrHost}/api/v1/movie/" + str(radarr["tmdbId"]),
-                    headers=headers,
-                )
-                overseerr = json.loads(o.text)
-                o = requests.delete(
-                    f"{c.overseerrHost}/api/v1/media/"
-                    + str(overseerr["mediaInfo"]["id"]),
-                    headers=headers,
-                )
-        except Exception as e:
-            print("ERROR: Unable to connect to overseerr. Error message: " + str(e))
+            tid = int(tmdbid)
+            radarr = next((m for m in radarr_list if m.get('tmdbId') == tid), None)
+        except ValueError:
+            radarr = None
+    else:
+        radarr = next((m for m in radarr_list if m.get('title') == movie['title']), None)
 
-        action = "DELETED"
-        if c.dryrun:
-            action = "DRY RUN"
+    if not radarr:
+        return deletesize
 
-        deletesize = int(movie["file_size"]) / 1073741824
-        print(
-            action
-            + ": "
-            + movie["title"]
-            + " | "
-            + str("{:.2f}".format(deletesize))
-            + "GB"
-            + " | Radarr ID: "
-            + str(radarr["id"])
-            + " | TMDB ID: "
-            + str(radarr["tmdbId"])
+    # skip protected
+    if radarr.get('tmdbId') in protected or any(tag in protected_tags for tag in radarr.get('tags', [])):
+        return deletesize
+
+    # delete from Radarr
+    if not c.dryrun:
+        requests.delete(
+            f"{c.radarrHost}/api/v3/movie/{radarr['id']}?apiKey={c.radarrAPIkey}&deleteFiles=true"
         )
-    except StopIteration:
-        pass
-    except Exception as e:
-        print("ERROR: " + movie["title"] + ": " + str(e))
 
+    # delete from Overseerr
+    if not c.dryrun and c.overseerrAPIkey:
+        try:
+            headers = {"X-Api-Key": c.overseerrAPIkey}
+            o = requests.get(
+                f"{c.overseerrHost}/api/v1/movie/{radarr['tmdbId']}", headers=headers
+            )
+            overseerr = o.json()
+            requests.delete(
+                f"{c.overseerrHost}/api/v1/media/{overseerr['mediaInfo']['id']}", headers=headers
+            )
+        except Exception:
+            print("ERROR: Unable to connect to Overseerr.")
+
+    action = "DRY RUN" if c.dryrun else "DELETED"
+    deletesize = int(movie.get('file_size', 0)) / 1073741824
+    print(f"{action}: {movie['title']} | {deletesize:.2f}GB | Radarr ID: {radarr['id']} | TMDB ID: {radarr['tmdbId']}")
     return deletesize
 
+# main
 
 today = round(datetime.now().timestamp())
 totalsize = 0
+count = 0
+
 r = requests.get(
     f"{c.tautulliHost}/api/v2/?apikey={c.tautulliAPIkey}&cmd=get_library_media_info&section_id={c.tautulliMovieSectionID}&length={c.tautulliNumRows}&refresh=true"
 )
-movies = json.loads(r.text)
-count = 0
+response = r.json()
+for movie in response.get('response', {}).get('data', {}).get('data', []):
+    last_played = movie.get('last_played')
+    if last_played:
+        days = (today - int(last_played)) / 86400
+        if days > c.daysSinceLastWatch:
+            totalsize += purge(movie)
+            count += 1
+    else:
+        added = movie.get('added_at')
+        if c.daysWithoutWatch > 0 and added and movie.get('play_count') is None:
+            days = (today - int(added)) / 86400
+            if days > c.daysWithoutWatch:
+                totalsize += purge(movie)
+                count += 1
 
-try:
-    for movie in movies["response"]["data"]["data"]:
-        if movie["last_played"]:
-            lp = round((today - int(movie["last_played"])) / 86400)
-            if lp > c.daysSinceLastWatch:
-                totalsize = totalsize + purge(movie)
-                count = count + 1
-        else:
-            if c.daysWithoutWatch > 0:
-                if movie["added_at"] and movie["play_count"] is None:
-                    aa = round((today - int(movie["added_at"])) / 86400)
-                    if aa > c.daysWithoutWatch:
-                        totalsize = totalsize + purge(movie)
-                        count = count + 1
-except Exception as e:
-    print(
-        "ERROR: There was a problem connecting to Tautulli/Radarr/Overseerr. Please double-check that your connection settings and API keys are correct.\n\nError message:\n"
-        + str(e)
-    )
-    sys.exit(1)
-
-print("Total space reclaimed: " + str("{:.2f}".format(totalsize)) + "GB")
-print("Total items deleted:   " + str(count))
+print(f"Total space reclaimed: {totalsize:.2f}GB")
+print(f"Total items deleted:   {count}")

@@ -3,7 +3,6 @@ import config
 import sys
 import json
 import requests
-import jq
 import argparse
 from argparse import RawTextHelpFormatter
 
@@ -36,112 +35,121 @@ def purge(movie):
     deletesize = 0
     tmdbid = None
 
-    r = requests.get(
+    # Retrieve metadata from Tautulli
+    resp = requests.get(
         f"{c.tautulliHost}/api/v2/?apikey={c.tautulliAPIkey}&cmd=get_metadata&rating_key={movie['rating_key']}"
     )
+    json_data = resp.json()
 
-    guids = jq.compile(".[].data.guids").input(r.json()).first()
+    # Extract GUIDs without jq
+    guids = []
+    if isinstance(json_data, dict) and 'response' in json_data:
+        data_section = json_data['response'].get('data', {})
+        # Case: metadata object
+        if isinstance(data_section, dict) and 'metadata' in data_section and 'guids' in data_section['metadata']:
+            guids = data_section['metadata'].get('guids', [])
+        else:
+            # Case: data list entries
+            entries = data_section.get('data', [])
+            for entry in entries:
+                data_field = entry.get('data', {})
+                if 'guids' in data_field:
+                    guids.extend(data_field['guids'])
+    elif isinstance(json_data, list):
+        for entry in json_data:
+            data_field = entry.get('data', {})
+            if 'guids' in data_field:
+                guids.extend(data_field['guids'])
 
     try:
-        if guids:
-            tmdbid = [i for i in guids if i.startswith("tmdb://")][0].split(
-                "tmdb://", 1
-            )[1]
+        for guid in guids:
+            if isinstance(guid, str) and guid.startswith("tmdb://"):
+                tmdbid = guid.split("tmdb://", 1)[1]
+                break
     except Exception as e:
         print(
-            f"WARNING: {movie['title']}: Unexpected GUID metadata from Tautulli. Please refresh your library's metadata in Plex. Using less-accurate 'search mode' for this title. Error message: "
-            + str(e)
+            f"WARNING: {movie['title']}: Unexpected GUID metadata from Tautulli. "
+            f"Please refresh your library's metadata in Plex. Using less-accurate 'search mode'. Error: {e}"
         )
         guids = []
 
-    f = requests.get(f"{c.radarrHost}/api/v3/movie?apiKey={c.radarrAPIkey}")
-    try:
-        if guids:
-            radarr = (
-                jq.compile(f".[] | select(.tmdbId == {tmdbid})").input(f.json()).first()
-            )
-        else:
-            radarr = (
-                jq.compile(f".[] | select(.title == \"{movie['title']}\")")
-                .input(f.json())
-                .first()
-            )
-        if not c.dryrun:
-            response = requests.delete(
-                f"{c.radarrHost}/api/v3/movie/"
-                + str(radarr["id"])
-                + f"?apiKey={c.radarrAPIkey}&deleteFiles=true"
-            )
-
+    # Query Radarr
+    radarr_resp = requests.get(f"{c.radarrHost}/api/v3/movie?apiKey={c.radarrAPIkey}")
+    radarr_movies = radarr_resp.json()
+    # Match by TMDB ID or by title
+    if tmdbid and guids:
         try:
-            if not c.dryrun and c.overseerrAPIkey is not None:
-                headers = {"X-Api-Key": f"{c.overseerrAPIkey}"}
-                o = requests.get(
-                    f"{c.overseerrHost}/api/v1/movie/" + str(radarr["tmdbId"]),
-                    headers=headers,
-                )
-                overseerr = json.loads(o.text)
-                o = requests.delete(
-                    f"{c.overseerrHost}/api/v1/media/"
-                    + str(overseerr["mediaInfo"]["id"]),
-                    headers=headers,
-                )
-        except Exception as e:
-            print("ERROR: Unable to connect to overseerr.")
+            tmdb_int = int(tmdbid)
+            radarr = next(m for m in radarr_movies if m.get('tmdbId') == tmdb_int)
+        except (StopIteration, ValueError):
+            radarr = None
+    else:
+        radarr = next((m for m in radarr_movies if m.get('title') == movie['title']), None)
 
-        action = "DELETED"
-        if c.dryrun:
-            action = "DRY RUN"
+    if not radarr:
+        print(f"No matching Radarr movie found for '{movie['title']}'.")
+        return deletesize
 
-        print(
-            action
-            + ": "
-            + movie["title"]
-            + " | Radarr ID: "
-            + str(radarr["id"])
-            + " | TMDB ID: "
-            + str(radarr["tmdbId"])
+    # Delete from Radarr
+    if not c.dryrun:
+        requests.delete(
+            f"{c.radarrHost}/api/v3/movie/{radarr['id']}?apiKey={c.radarrAPIkey}&deleteFiles=true"
         )
-        deletesize = int(movie["file_size"]) / 1073741824
-    except StopIteration:
-        pass
-    except Exception as e:
-        print("ERROR: " + movie["title"] + ": " + str(e))
+
+    # Optionally delete from Overseerr
+    if not c.dryrun and c.overseerrAPIkey:
+        try:
+            headers = {"X-Api-Key": c.overseerrAPIkey}
+            o_resp = requests.get(
+                f"{c.overseerrHost}/api/v1/movie/{radarr['tmdbId']}",
+                headers=headers,
+            )
+            overseerr = o_resp.json()
+            requests.delete(
+                f"{c.overseerrHost}/api/v1/media/{overseerr['mediaInfo']['id']}",
+                headers=headers,
+            )
+        except Exception:
+            print("ERROR: Unable to connect to Overseerr.")
+
+    action = "DRY RUN" if c.dryrun else "DELETED"
+    print(
+        f"{action}: {movie['title']} | Radarr ID: {radarr['id']} | TMDB ID: {radarr['tmdbId']}"
+    )
+    deletesize = int(movie.get('file_size', 0)) / 1073741824
 
     return deletesize
 
 
 totalsize = 0
-r = requests.get(
-    f"{c.tautulliHost}/api/v2/?apikey={c.tautulliAPIkey}&cmd=get_library_media_info&section_id={c.tautulliMovieSectionID}&search={args.title}&refresh=true"
+# Search Tautulli for the movie
+search_resp = requests.get(
+    f"{c.tautulliHost}/api/v2/?apikey={c.tautulliAPIkey}" \
+    f"&cmd=get_library_media_info&section_id={c.tautulliMovieSectionID}" \
+    f"&search={args.title}&refresh=true"
 )
-movies = json.loads(r.text)
+movies = search_resp.json()
 
 try:
-    if len(movies["response"]["data"]["data"]) == 1:
-        movie = movies["response"]["data"]["data"][0]
-        confirmation = input(
-            "Movie found:\n"
-            + movie["title"]
-            + " ("
-            + movie["year"]
-            + ")\nDelete it? [N]: "
-        )
-        if confirmation.lower() == "y":
-            confirmation = 1
-        else:
-            confirmation = 0
-    elif len(movies["response"]["data"]["data"]) > 1:
+    data_list = movies['response']['data']['data']
+    count = len(data_list)
+    if count == 1:
+        movie = data_list[0]
+        confirm = input(
+            f"Movie found:\n{movie['title']} ({movie['year']})\nDelete it? [N]: "
+        ).lower()
+        confirmation = 1 if confirm == 'y' else 0
+    elif count > 1:
         print("[0] Delete nothing")
-        for i, movie in enumerate(movies["response"]["data"]["data"], 1):
-            print("[" + str(i) + "] " + movie["title"] + " (" + movie["year"] + ")")
+        for idx, mv in enumerate(data_list, start=1):
+            print(f"[{idx}] {mv['title']} ({mv['year']})")
+        if c.dryrun:
+            print("DRY RUN MODE - no selected movies will be deleted")
+        else:
+            print("*** The selected movie will be deleted ***")
         try:
-            if c.dryrun:
-                print("DRY RUN MODE - no selected movies will be deleted")
-            else:
-                print("*** The selected movie will be deleted ***")
             confirmation = int(input("Choose a movie to delete [0]: "))
-        except:
+        except ValueError:
             print("No action taken.")
             sys.exit(0)
     else:
@@ -149,17 +157,14 @@ try:
         sys.exit(0)
 
     if confirmation > 0:
-        try:
-            confirmation = confirmation - 1
-            movie = movies["response"]["data"]["data"][confirmation]
-            print("Total space reclaimed: " + str("{:.2f}".format(purge(movie))) + "GB")
-        except Exception as e:
-            print("Couldn't delete movie.\n\n" + str(e))
+        movie = data_list[confirmation - 1]
+        reclaimed = purge(movie)
+        print(f"Total space reclaimed: {reclaimed:.2f} GB")
     else:
         print("No action taken.")
 except Exception as e:
     print(
-        "ERROR: There was a problem connecting to Tautulli/Radarr/Overseerr. Please double-check that your connection settings and API keys are correct.\n\nError message:\n"
-        + str(e)
+        "ERROR: There was a problem connecting to Tautulli/Radarr/Overseerr. "
+        "Please double-check your settings and API keys.\n\nError message:\n" + str(e)
     )
     sys.exit(1)
